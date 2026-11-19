@@ -3,11 +3,14 @@
 import asyncio
 import json
 import math
+from pathlib import Path
 
 import pandas as pd
 import pytest
 
 from solution import BAR_MS, backtest, main, trade_pnl
+
+EXAMPLE = Path(__file__).resolve().parent.parent / "examples" / "bybit_spot_BTCUSDT_1m.json"
 
 T0 = 1_699_999_980_000
 
@@ -140,3 +143,24 @@ def test_main_end_to_end_from_file(tmp_path, capsys):
     assert "Закрытые сделки" in out
     assert "Winrate:" in out
     assert "суммарный чистый PnL" in out
+
+
+def test_exit_slippage_warning_and_gap_note():
+    warnings = []
+    ts = [T0 + i * BAR_MS for i in (0, 1, 2, 3, 9)]  # перед последним баром пропуск 5 минут
+    df = frame(opens=[100, 100, 100, 100, 99], closes=[100, 100, 100, 100, 99], buys={1}, sells={3}, ts=ts)
+    (t,) = backtest(df, warmup=0, warn=warnings.append).trades
+    assert t.exit_slippage == pytest.approx(-0.01)
+    assert len(warnings) == 1 and "выхода" in warnings[0]
+    assert "проскальзывание выхода -1.00%" in t.notes
+    assert "выход после пропуска минут" in t.notes
+
+
+def test_example_file_matches_readme(capsys):
+    """Сохранённый ответ Bybit из examples/: те же числа, что в README."""
+    assert asyncio.run(main(["--from-file", str(EXAMPLE)])) == 0
+    out = capsys.readouterr().out
+    assert "осталось баров:              999" in out
+    assert "сделок: 15 (из них закрыта принудительно в конце данных: 1)" in out
+    assert "Winrate: 13.3% (2 из 15 с чистым PnL > 0)" in out
+    assert "суммарный чистый PnL: -29.43 USDT" in out

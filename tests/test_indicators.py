@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from solution import add_signals, crossover, crossunder, ema
+from solution import add_signals, crossover, crossunder, default_warmup, ema
 
 
 def test_ema_sma_seed_by_hand():
@@ -71,3 +71,20 @@ def test_warmup_hides_seed_difference():
     assert (tv["buy"].iloc[warmup:] == us["buy"].iloc[warmup:]).all()
     assert (tv["sell"].iloc[warmup:] == us["sell"].iloc[warmup:]).all()
     assert tv["buy"].iloc[warmup:].sum() > 0  # сигналы в окне вообще есть
+
+
+def test_default_warmup_follows_the_longer_ema():
+    assert default_warmup(9, 21) == 210
+    assert default_warmup(50, 21) == 500
+
+
+@pytest.mark.parametrize(("fast", "slow"), [(9, 21), (21, 9), (50, 21)])
+def test_default_warmup_hides_seed_for_any_order(fast, slow):
+    """Если fast длиннее slow, засев дольше помнит fast: прогрев 10 * slow тут не хватало."""
+    warmup = default_warmup(fast, slow)
+    for seed in range(5):
+        full = random_walk(4000, seed)
+        tv = add_signals(pd.DataFrame({"close": full}), fast, slow).iloc[-1000:].reset_index(drop=True)
+        us = add_signals(pd.DataFrame({"close": full[-1000:]}), fast, slow)
+        assert (tv["buy"].iloc[warmup:] == us["buy"].iloc[warmup:]).all()
+        assert (tv["sell"].iloc[warmup:] == us["sell"].iloc[warmup:]).all()

@@ -86,7 +86,8 @@ def check_payload(payload: dict) -> None:
         raise BybitError("ответ не JSON-объект")
     if payload.get("retCode") != 0:
         raise BybitError(f"retCode={payload.get('retCode')} retMsg={payload.get('retMsg')!r}")
-    if not isinstance((payload.get("result") or {}).get("list"), list):
+    result = payload.get("result")
+    if not isinstance(result, dict) or not isinstance(result.get("list"), list):
         raise BybitError("в ответе нет result.list")
 
 
@@ -97,10 +98,12 @@ def check_payload(payload: dict) -> None:
 class CleaningReport:
     received: int = 0
     order: str = ""  # в каком порядке пришли свечи
-    malformed: int = 0  # строку не удалось разобрать (не хватает полей, не число)
+    clock: str = ""  # по каким часам решали, закрыта ли свеча
+    malformed: int = 0  # строку не удалось разобрать (нет времени или цены, не число)
     unclosed: int = 0  # свеча ещё не закрылась по времени
     broken: int = 0  # цена <= 0 или не число, high < low, open/close вне [low, high]
     duplicates: int = 0  # повтор startTime
+    duplicate_conflicts: int = 0  # из них с разными ценами у копий
     gaps: int = 0  # сколько раз между соседними барами больше минуты
     missing_minutes: int = 0  # сколько минут пропущено всего
     kept: int = 0
@@ -111,18 +114,21 @@ def clean_klines(payload: dict, now_ms: int | None = None) -> tuple[pd.DataFrame
 
     Что делаем и почему:
     - Bybit отдаёт числа строками: [startTime, open, high, low, close, volume, turnover].
-      Строку, которую нельзя разобрать, выбрасываем.
+      Строку без разборчивого времени или цен выбрасываем. Объём стратегии не нужен,
+      поэтому из-за плохого объёма бар не выбрасываем (у TV этот бар есть).
     - Незакрытая свеча. Первая в ответе обычно текущая минута, её close ещё меняется.
       Сигнал считается строго по закрытию бара, поэтому такую свечу отбрасываем.
       Закрытость проверяем по времени сервера Bybit (поле time в ответе), а не по
       локальным часам, у которых может быть сдвиг: startTime + 60 с > now -> не закрыта.
+      Если поля time нет, берём локальные часы и пишем об этом в сводке.
     - Битые свечи (цена <= 0 или не число, high < low, open/close вне [low, high],
       время не кратно минуте) выбрасываем, а не чиним: настоящих цен мы не знаем,
       а придуманная цена может дать ложное пересечение EMA.
     - Порядок. Bybit отдаёт от новых к старым, EMA считается от старых к новым,
       поэтому сортируем по startTime.
-    - Дубли по startTime: оставляем первый. Битые убираем раньше дублей, чтобы битая
-      копия не вытеснила нормальную.
+    - Дубли по startTime: оставляем первую копию в порядке ответа. Битые убираем раньше
+      дублей, чтобы битая копия не вытеснила нормальную. Если у копий разные цены,
+      какая верна, из одного ответа не понять: считаем такие случаи отдельно.
     - Пропуски минут не заполняем, только считаем. TradingView рисует бар только там,
       где были сделки, и считает EMA по существующим барам. Если дорисовать пустые
       минуты, у нас появятся бары, которых нет у TV, и EMA разойдётся с графиком.
@@ -130,20 +136,32 @@ def clean_klines(payload: dict, now_ms: int | None = None) -> tuple[pd.DataFrame
     report = CleaningReport()
     raw_rows = payload["result"]["list"]
     report.received = len(raw_rows)
-    if now_ms is None:
-        now_ms = int(payload.get("time") or time.time() * 1000)
+    if now_ms is not None:
+        report.clock = "заданное время"
+    elif payload.get("time"):
+        now_ms, report.clock = int(payload["time"]), "время сервера Bybit"
+    else:
+        now_ms, report.clock = int(time.time() * 1000), "локальные часы (в ответе нет time)"
 
+    bad_row = (TypeError, ValueError, IndexError, KeyError)
     rows = []
     for raw in raw_rows:
         try:
             ts = int(raw[0])
-            o, h, low, c, v = (float(x) for x in raw[1:6])
-        except (TypeError, ValueError, IndexError):
+            o, h, low, c = (float(x) for x in raw[1:5])
+        except bad_row:
             report.malformed += 1
             continue
+        try:
+            v = float(raw[5])
+        except bad_row:
+            v = float("nan")
         rows.append((ts, o, h, low, c, v))
 
-    df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
+    # Типы задаём явно: если не осталось ни одной строки, без этого колонки будут object.
+    df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"]).astype(
+        {"ts": "int64", "open": float, "high": float, "low": float, "close": float, "volume": float}
+    )
     if len(df) < 2 or df["ts"].is_monotonic_increasing:
         report.order = "по возрастанию времени"
     elif df["ts"].is_monotonic_decreasing:
@@ -157,9 +175,8 @@ def clean_klines(payload: dict, now_ms: int | None = None) -> tuple[pd.DataFrame
 
     prices = df[["open", "high", "low", "close"]]
     broken = (
-        ~np.isfinite(df[["open", "high", "low", "close", "volume"]]).all(axis=1)
+        ~np.isfinite(prices).all(axis=1)
         | (prices <= 0).any(axis=1)
-        | (df["volume"] < 0)
         | (df["high"] < df["low"])
         | (df["open"] > df["high"])
         | (df["open"] < df["low"])
@@ -173,6 +190,9 @@ def clean_klines(payload: dict, now_ms: int | None = None) -> tuple[pd.DataFrame
     df = df.sort_values("ts", kind="stable")
     dup = df["ts"].duplicated(keep="first")
     report.duplicates = int(dup.sum())
+    # разные версии одной минуты: после удаления точных копий startTime всё ещё повторяется
+    versions = df.drop_duplicates(["ts", "open", "high", "low", "close"])["ts"]
+    report.duplicate_conflicts = int(versions[versions.duplicated()].nunique())
     df = df[~dup].reset_index(drop=True)
 
     step = df["ts"].diff()
@@ -231,6 +251,16 @@ def crossover(a: pd.Series, b: pd.Series) -> pd.Series:
 def crossunder(a: pd.Series, b: pd.Series) -> pd.Series:
     """ta.crossunder: a < b на текущем баре и a >= b на предыдущем."""
     return (a < b) & (a.shift(1) >= b.shift(1))
+
+
+def default_warmup(fast: int, slow: int) -> int:
+    """Сколько первых баров не торговать: 10 длин более медленной EMA.
+
+    Дольше всех засев помнит EMA с большей длиной L (это не обязательно slow).
+    Она засевается на баре L - 1, и к бару 10 * L ошибка засева умножится на
+    (1 - 2 / (L + 1)) ** (9 * L + 1), это около e^-18 = 1.5e-8 при любой L.
+    """
+    return 10 * max(fast, slow)
 
 
 def add_signals(df: pd.DataFrame, fast: int, slow: int, seed: str = "sma") -> pd.DataFrame:
@@ -420,8 +450,13 @@ def print_cleaning(df: pd.DataFrame, report: CleaningReport, symbol: str) -> Non
     print("Очистка данных:")
     print(f"  порядок в ответе:            {report.order}")
     print(f"  незакрытая текущая свеча:    {report.unclosed} (отброшена)")
+    if report.clock.startswith("локальные"):
+        print(f"    ВНИМАНИЕ: закрытость свечей проверена по часам этого компьютера: {report.clock}")
     print(f"  битые бары:                  {report.broken} (удалены)")
-    print(f"  дубли:                       {report.duplicates} (удалены)")
+    conflicts = (
+        f", из них с разными ценами: {report.duplicate_conflicts}" if report.duplicate_conflicts else ""
+    )
+    print(f"  дубли:                       {report.duplicates} (удалены{conflicts})")
     print(f"  нераспознанные строки:       {report.malformed} (удалены)")
     print(f"  пропуски минут:              {report.gaps} дыр, {report.missing_minutes} мин (не заполняем)")
     print(f"  осталось баров:              {report.kept}", end="")
@@ -508,7 +543,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--warmup",
         type=int,
         default=None,
-        help="сколько первых баров не торговать, пока EMA не забудет засев (по умолчанию 10 * slow)",
+        help="сколько первых баров не торговать, пока EMA помнят засев (по умолчанию 10 * max(fast, slow))",
     )
     p.add_argument("--ema-seed", choices=["sma", "first"], default="sma", help="чем засевать EMA")
     p.add_argument("--from-file", type=Path, help="взять сохранённый ответ Bybit (JSON) вместо запроса")
@@ -520,7 +555,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.fast < 1 or args.slow < 1:
         p.error("длины EMA должны быть >= 1")
     if args.warmup is None:
-        args.warmup = 10 * args.slow
+        args.warmup = default_warmup(args.fast, args.slow)
     if args.warmup < 0:
         p.error("--warmup не может быть отрицательным")
     return args
@@ -550,7 +585,8 @@ async def main(argv: list[str] | None = None) -> int:
         return 1
 
     df, report = clean_klines(payload)
-    print_cleaning(df, report, args.symbol)
+    # символ берём из ответа: с --from-file флаг --symbol мог бы назвать не ту пару
+    print_cleaning(df, report, payload["result"].get("symbol") or args.symbol)
 
     df = add_signals(df, args.fast, args.slow, args.ema_seed)
     print_signals(df, args)

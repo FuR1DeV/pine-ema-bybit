@@ -1,12 +1,14 @@
 """Загрузка и очистка свечей. Сеть не нужна: ответы Bybit синтетические."""
 
 import asyncio
+import json
+import time
 
 import httpx
 import pytest
 
 import solution
-from solution import BAR_MS, BybitError, clean_klines, fetch_klines
+from solution import BAR_MS, BybitError, check_payload, clean_klines, fetch_klines, main
 
 T0 = 1_699_999_980_000  # кратно минуте
 
@@ -142,3 +144,46 @@ def test_fetch_non_json_is_bybit_error():
 def test_mixed_order_is_reported():
     _, rep = clean_klines(payload([bar(1), bar(0), bar(2)], now_ms=T0 + 10 * BAR_MS))
     assert rep.order.startswith("вперемешку")
+
+
+@pytest.mark.parametrize("rows", [[], [["abc"], {"0": 1}, None]], ids=["empty", "all-malformed"])
+def test_no_valid_rows_does_not_crash(rows):
+    df, rep = clean_klines(payload(rows, now_ms=T0))
+    assert df.empty and rep.kept == 0
+    assert rep.malformed == len(rows)
+
+
+def test_main_with_empty_response(tmp_path, capsys):
+    raw = tmp_path / "empty.json"
+    raw.write_text(json.dumps(payload([], now_ms=T0)), encoding="utf-8")
+    assert asyncio.run(main(["--from-file", str(raw)])) == 0
+    out = capsys.readouterr().out
+    assert "осталось баров:              0" in out
+    assert "сделок нет" in out
+
+
+def test_missing_time_falls_back_to_local_clock():
+    current_minute = int(time.time() * 1000) // BAR_MS * BAR_MS
+    rows = [[str(current_minute), "100", "101", "99", "100.5", "1", "1"], bar(0)]
+    _, rep = clean_klines({"retCode": 0, "result": {"list": rows}})
+    assert rep.unclosed == 1
+    assert rep.clock.startswith("локальные")
+
+
+def test_duplicate_with_different_prices_is_reported():
+    rows = [bar(1), bar(0, c="100.7"), bar(0)]
+    df, rep = clean_klines(payload(rows, now_ms=T0 + 10 * BAR_MS))
+    assert rep.duplicates == 1 and rep.duplicate_conflicts == 1
+    assert df["close"].tolist() == [100.7, 100.5]  # первая копия в порядке ответа
+
+
+def test_bad_volume_does_not_drop_bar():
+    rows = [bar(1), [str(T0), "100", "101", "99", "100.5", "abc", "1"]]
+    _, rep = clean_klines(payload(rows, now_ms=T0 + 10 * BAR_MS))
+    assert rep.kept == 2 and rep.broken == 0 and rep.malformed == 0
+
+
+@pytest.mark.parametrize("bad", [[], {"retCode": 0, "result": []}, {"retCode": 0, "result": {"list": {}}}])
+def test_check_payload_rejects_wrong_shape(bad):
+    with pytest.raises(BybitError):
+        check_payload(bad)

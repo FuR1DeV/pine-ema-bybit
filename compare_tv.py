@@ -36,6 +36,7 @@ from solution import (
     clean_klines,
     crossover,
     crossunder,
+    default_warmup,
     fetch_klines,
     fmt_time,
 )
@@ -208,16 +209,26 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--raw", type=Path, default=Path("examples/bybit_spot_BTCUSDT_1m.json"))
     p.add_argument("--fast", type=int, default=9)
     p.add_argument("--slow", type=int, default=21)
-    p.add_argument("--warmup", type=int, default=None, help="по умолчанию 10 * slow, как в solution.py")
+    p.add_argument(
+        "--warmup", type=int, default=None, help="по умолчанию 10 * max(fast, slow), как в solution.py"
+    )
     p.add_argument("--ema-seed", choices=["sma", "first"], default="sma")
     p.add_argument("--symbol", default="BTCUSDT")
     p.add_argument("--base-url", default=BYBIT_BASE_URL)
     args = p.parse_args(argv)
-    warmup = 10 * args.slow if args.warmup is None else args.warmup
+    warmup = default_warmup(args.fast, args.slow) if args.warmup is None else args.warmup
 
     payload = json.loads(args.raw.read_text(encoding="utf-8"))
     check_payload(payload)
     ours, _ = clean_klines(payload)
+    if ours.empty:
+        p.error(f"в {args.raw} нет ни одной закрытой свечи")
+    # Эталон должен начинаться раньше наших данных, иначе у него свой свежий засев
+    # и «расхождения после прогрева» будут ложными.
+    if args.bybit_history is not None and args.bybit_history <= len(ours) + warmup:
+        p.error(
+            f"--bybit-history должно быть больше {len(ours) + warmup} (наши бары + прогрев), например 3000"
+        )
     ours = add_signals(ours, args.fast, args.slow, args.ema_seed)
     if args.tv:
         name = f"TradingView, {args.tv.name}"
