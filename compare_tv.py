@@ -41,7 +41,7 @@ from solution import (
 )
 
 PRICE_COLS = ("open", "high", "low", "close")
-PRICE_TOLERANCE = 1e-6  # цены у Bybit с шагом 0.01, всё, что больше, это другая свеча
+PRICE_TOLERANCE = 1e-6  # шаг цены BTCUSDT на споте Bybit 0.1, всё, что больше, это другая свеча
 
 
 def find_column(df: pd.DataFrame, name: str) -> str | None:

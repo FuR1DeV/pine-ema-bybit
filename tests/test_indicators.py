@@ -57,7 +57,7 @@ def random_walk(n: int, seed: int = 7) -> np.ndarray:
 def test_warmup_hides_seed_difference():
     """У TradingView история длиннее наших 1000 баров. Считаем EMA по 3000 барам
     («как у TV») и только по последним 1000 («как у нас»): после прогрева 10 * slow
-    расхождение меньше шага цены BTCUSDT (0.01), а сигналы совпадают."""
+    расхождение меньше 0.01 (шаг цены BTCUSDT на споте Bybit 0.1), а сигналы совпадают."""
     full = random_walk(3000)
     ours = full[-1000:]
     warmup = 10 * 21
