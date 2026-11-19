@@ -75,7 +75,7 @@ def test_reports_signal_and_candle_mismatch(tmp_path):
 
     res = compare(ours, tv, WARMUP)
     assert len(res.mismatches_after) == 1
-    assert "у нас нет, у TV BUY" in res.mismatches_after[0]
+    assert "у нас нет, у эталона BUY" in res.mismatches_after[0]
     assert len(res.candle_diffs) == 1
 
 

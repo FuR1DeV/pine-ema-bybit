@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Сверка EMA и сигналов solution.py с выгрузкой графика TradingView бар за баром.
+"""Сверка EMA и сигналов solution.py с эталоном, у которого длинная история, бар за баром.
 
-1. На TradingView открыть BYBIT:BTCUSDT (спот), 1m, добавить на график
-   tradingview/ema_crossover_export.pine и выгрузить Export chart data.
-2. python compare_tv.py --tv export.csv [--raw examples/bybit_spot_BTCUSDT_1m.json]
+Эталон 1, выгрузка графика TradingView:
+  на TradingView открыть BYBIT:BTCUSDT (спот), 1m, добавить на график
+  tradingview/ema_crossover_export.pine и выгрузить Export chart data, затем
+  python compare_tv.py --tv export.csv [--raw examples/bybit_spot_BTCUSDT_1m.json]
 
-Сравниваются бары, которые есть и у нас, и в выгрузке TV (по времени открытия бара):
+Эталон 2, без TradingView: та же стратегия на 3000 барах Bybit, которые кончаются
+на последнем нашем баре (несколько запросов с параметром end):
+  python compare_tv.py --bybit-history 3000
+
+Сравниваются бары, которые есть и у нас, и у эталона (по времени открытия бара):
 сами свечи, значения EMA и сигналы. Код возврата 1, если после прогрева есть
 расхождения в сигналах.
 """
@@ -13,15 +18,27 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import httpx
 import numpy as np
 import pandas as pd
 
-from solution import add_signals, check_payload, clean_klines, crossover, crossunder, fmt_time
+from solution import (
+    BAR_MS,
+    BYBIT_BASE_URL,
+    add_signals,
+    check_payload,
+    clean_klines,
+    crossover,
+    crossunder,
+    fetch_klines,
+    fmt_time,
+)
 
 PRICE_COLS = ("open", "high", "low", "close")
 PRICE_TOLERANCE = 1e-6  # цены у Bybit с шагом 0.01, всё, что больше, это другая свеча
@@ -80,6 +97,23 @@ def load_tv_csv(path: Path) -> tuple[pd.DataFrame, str]:
     return out, "пересчитаны по EMA из выгрузки TV"
 
 
+async def load_bybit_history(last_ts: int, total: int, args: argparse.Namespace) -> tuple[pd.DataFrame, str]:
+    """Эталон без TradingView: total минутных баров Bybit, последний из которых равен
+    нашему последнему бару. EMA по ним идёт с длинной историей, как на графике TV."""
+    rows: list = []
+    end = last_ts
+    async with httpx.AsyncClient(base_url=args.base_url, timeout=10.0) as client:
+        while len(rows) < total:
+            chunk = (await fetch_klines(client, args.symbol, 1000, end_ms=end))["result"]["list"]
+            if not chunk:
+                break
+            rows += chunk
+            end = min(int(r[0]) for r in chunk) - 1
+    ref, _ = clean_klines({"result": {"list": rows}}, now_ms=last_ts + BAR_MS)
+    ref = add_signals(ref.iloc[-total:].reset_index(drop=True), args.fast, args.slow, args.ema_seed)
+    return ref, f"посчитаны нами по {len(ref)} барам Bybit начиная с {fmt_time(ref['time'].iloc[0])} UTC"
+
+
 @dataclass
 class Comparison:
     ours_bars: int = 0
@@ -117,7 +151,7 @@ def compare(ours: pd.DataFrame, tv: pd.DataFrame, warmup: int) -> Comparison:
             continue
         bad = m[(m[c] - m[f"{c}_tv"]).abs() > PRICE_TOLERANCE]
         res.candle_diffs += [
-            f"{fmt_time(r.time)} {c}: у нас {getattr(r, c)}, у TV {getattr(r, c + '_tv')}"
+            f"{fmt_time(r.time)} {c}: у нас {getattr(r, c)}, у эталона {getattr(r, c + '_tv')}"
             for r in bad.itertuples()
         ]
 
@@ -129,45 +163,55 @@ def compare(ours: pd.DataFrame, tv: pd.DataFrame, warmup: int) -> Comparison:
     res.mismatches_warmup = int((mismatch & ~after).sum())
     res.signals_after = int((m["buy"] | m["sell"])[after].sum())
     res.mismatches_after = [
-        f"{fmt_time(r.time)}: у нас {label(r.buy, r.sell)}, у TV {label(r.buy_tv, r.sell_tv)}"
+        f"{fmt_time(r.time)}: у нас {label(r.buy, r.sell)}, у эталона {label(r.buy_tv, r.sell_tv)}"
         for r in m[mismatch & after].itertuples()
     ]
     return res
 
 
-def print_comparison(res: Comparison, warmup: int, signals_source: str, args: argparse.Namespace) -> None:
-    print(f"Сверка с TradingView: EMA {args.fast}/{args.slow}, засев {args.ema_seed}, прогрев {warmup} баров")
-    print(f"  сигналы TV: {signals_source}")
-    print(f"  баров у нас: {res.ours_bars}, у TV в том же интервале: {res.tv_bars}, общих: {res.common}")
+def print_comparison(res: Comparison, warmup: int, ref: str, source: str, args: argparse.Namespace) -> None:
+    print(f"Сверка с эталоном ({ref}): EMA {args.fast}/{args.slow}, засев {args.ema_seed}, прогрев {warmup}")
+    print(f"  сигналы эталона: {source}")
+    print(f"  баров у нас: {res.ours_bars}, у эталона в том же интервале: {res.tv_bars}, общих: {res.common}")
     if res.only_ours or res.only_tv:
-        print(f"  есть только у нас: {len(res.only_ours)}, только у TV: {len(res.only_tv)}")
+        print(f"  есть только у нас: {len(res.only_ours)}, только у эталона: {len(res.only_tv)}")
         for t in (res.only_ours[:5] + res.only_tv[:5])[:10]:
             print(f"    {fmt_time(t)}")
     if res.common < res.ours_bars:
-        print("  ВНИМАНИЕ: выгрузка TV покрывает не весь интервал наших данных")
+        print("  ВНИМАНИЕ: эталон покрывает не весь интервал наших данных")
     print(f"  свечи с другими ценами: {len(res.candle_diffs)}")
     for line in res.candle_diffs[:10]:
         print(f"    {line}")
+
+    def num(x: float) -> str:
+        if np.isnan(x):
+            return "-"
+        return f"{x:.6f}" if x == 0 or x >= 1e-3 else f"{x:.1e}"
+
     for k, length in (("fast", args.fast), ("slow", args.slow)):
         w, a = res.ema_diff[k]
-        print(f"  EMA {length}: макс. разница в прогреве {w:.6f}, после прогрева {a:.6f}")
-    print(f"  сигналы в прогреве: расходятся на {res.mismatches_warmup} барах (ожидаемо, засев)")
+        print(f"  EMA {length}: макс. разница в прогреве {num(w)}, после прогрева {num(a)}")
+    print(f"  сигналы в прогреве: баров с расхождением {res.mismatches_warmup} (ожидаемо, засев)")
     print(
         f"  сигналы после прогрева: у нас {res.signals_after}, "
-        f"расходятся на {len(res.mismatches_after)} барах"
+        f"баров с расхождением {len(res.mismatches_after)}"
     )
     for line in res.mismatches_after:
         print(f"    {line}")
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Сверка solution.py с выгрузкой графика TradingView")
-    p.add_argument("--tv", type=Path, required=True, help="CSV из Export chart data")
+    p = argparse.ArgumentParser(description="Сверка solution.py с эталоном с длинной историей")
+    ref = p.add_mutually_exclusive_group(required=True)
+    ref.add_argument("--tv", type=Path, help="CSV из Export chart data TradingView")
+    ref.add_argument("--bybit-history", type=int, metavar="N", help="эталон из N баров Bybit, например 3000")
     p.add_argument("--raw", type=Path, default=Path("examples/bybit_spot_BTCUSDT_1m.json"))
     p.add_argument("--fast", type=int, default=9)
     p.add_argument("--slow", type=int, default=21)
     p.add_argument("--warmup", type=int, default=None, help="по умолчанию 10 * slow, как в solution.py")
     p.add_argument("--ema-seed", choices=["sma", "first"], default="sma")
+    p.add_argument("--symbol", default="BTCUSDT")
+    p.add_argument("--base-url", default=BYBIT_BASE_URL)
     args = p.parse_args(argv)
     warmup = 10 * args.slow if args.warmup is None else args.warmup
 
@@ -175,10 +219,17 @@ def main(argv: list[str] | None = None) -> int:
     check_payload(payload)
     ours, _ = clean_klines(payload)
     ours = add_signals(ours, args.fast, args.slow, args.ema_seed)
-    tv, source = load_tv_csv(args.tv)
+    if args.tv:
+        name = f"TradingView, {args.tv.name}"
+        reference, source = load_tv_csv(args.tv)
+    else:
+        name = f"Bybit, {args.bybit_history} баров"
+        reference, source = asyncio.run(
+            load_bybit_history(int(ours["ts"].iloc[-1]), args.bybit_history, args)
+        )
 
-    res = compare(ours, tv, warmup)
-    print_comparison(res, warmup, source, args)
+    res = compare(ours, reference, warmup)
+    print_comparison(res, warmup, name, source, args)
     return 1 if res.mismatches_after or res.common == 0 else 0
 
 

@@ -50,13 +50,17 @@ async def fetch_klines(
     symbol: str = "BTCUSDT",
     limit: int = 1000,
     attempts: int = 3,
+    end_ms: int | None = None,
 ) -> dict:
     """Один запрос /v5/market/kline (spot, 1m), пагинация не нужна.
 
+    end_ms (параметр end у Bybit) нужен только compare_tv.py, чтобы взять историю длиннее.
     Повторяем только сетевые сбои и 5xx. Ошибки самого API (неверный символ и т.п.)
     Bybit отдаёт с HTTP 200 и retCode != 0, поэтому retCode проверяем отдельно.
     """
     params = {"category": "spot", "symbol": symbol, "interval": "1", "limit": limit}
+    if end_ms is not None:
+        params["end"] = end_ms
     for attempt in range(1, attempts + 1):
         try:
             resp = await client.get(KLINE_PATH, params=params)
