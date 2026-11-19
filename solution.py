@@ -4,6 +4,7 @@
 1. Асинхронно (httpx) загружает последние 1000 минутных свечей BTCUSDT
    со спотового REST API Bybit (/v5/market/kline) одним запросом.
 2. Чистит данные (clean_klines): порядок, дубли, битые и незакрытая свеча, пропуски.
+3. Считает EMA 9/21 и пересечения так же, как ta.ema / ta.crossover / ta.crossunder.
 
 Решения и известные расхождения с TradingView описаны в README.md.
 """
@@ -153,6 +154,68 @@ def clean_klines(payload: dict, now_ms: int | None = None) -> tuple[pd.DataFrame
     return df, report
 
 
+# --------------------------------------------------------------------------- индикаторы
+
+
+def ema(values, length: int, seed: str = "sma") -> np.ndarray:
+    """EMA как ta.ema в Pine v5: alpha = 2 / (length + 1),
+    ema[i] = alpha * src[i] + (1 - alpha) * ema[i - 1].
+
+    seed="sma" (по умолчанию): первые length - 1 значений na, на баре length - 1
+    значение равно SMA первых length закрытий. Так ведёт себя встроенная ta.ema
+    на графике: EMA(21) появляется только с 21-го бара истории.
+    seed="first": засев первым значением источника, как в примере pine_ema
+    из справки Pine. Оставлено для сверки.
+
+    От засева зависят только первые бары: ошибка засева умножается на
+    (1 - alpha) на каждом баре и затухает. Поэтому в начале данных есть прогрев
+    без торговли (см. README).
+    """
+    if length < 1:
+        raise ValueError("length должен быть >= 1")
+    src = np.asarray(values, dtype=float)
+    out = np.full(len(src), np.nan)
+    alpha = 2.0 / (length + 1)
+    if seed == "sma":
+        if len(src) < length:
+            return out
+        start = length - 1
+        out[start] = src[:length].mean()
+    elif seed == "first":
+        if len(src) == 0:
+            return out
+        start = 0
+        out[0] = src[0]
+    else:
+        raise ValueError(f"неизвестный seed: {seed}")
+    for i in range(start + 1, len(src)):
+        out[i] = alpha * src[i] + (1 - alpha) * out[i - 1]
+    return out
+
+
+def crossover(a: pd.Series, b: pd.Series) -> pd.Series:
+    """ta.crossover: a > b на текущем баре и a <= b на предыдущем.
+    Сравнение с na даёт false, как в Pine: на первом баре EMA пересечения нет."""
+    return (a > b) & (a.shift(1) <= b.shift(1))
+
+
+def crossunder(a: pd.Series, b: pd.Series) -> pd.Series:
+    """ta.crossunder: a < b на текущем баре и a >= b на предыдущем."""
+    return (a < b) & (a.shift(1) >= b.shift(1))
+
+
+def add_signals(df: pd.DataFrame, fast: int, slow: int, seed: str = "sma") -> pd.DataFrame:
+    """EMA и сигналы по Close каждого бара. Сигнал бара T известен только после его
+    закрытия, исполнять его можно не раньше Open бара T + 1 (это делает backtest)."""
+    out = df.copy()
+    close = out["close"].to_numpy(dtype=float)
+    out["ema_fast"] = ema(close, fast, seed)
+    out["ema_slow"] = ema(close, slow, seed)
+    out["buy"] = crossover(out["ema_fast"], out["ema_slow"])
+    out["sell"] = crossunder(out["ema_fast"], out["ema_slow"])
+    return out
+
+
 # --------------------------------------------------------------------------- вывод
 
 
@@ -177,6 +240,29 @@ def print_cleaning(df: pd.DataFrame, report: CleaningReport, symbol: str) -> Non
         print()
 
 
+def print_signals(df: pd.DataFrame, args: argparse.Namespace) -> None:
+    in_warmup = df.index < args.warmup
+    buys, sells = df["buy"], df["sell"]
+    print(f"\nИндикаторы: EMA {args.fast} / EMA {args.slow}, засев {args.ema_seed}, прогрев {args.warmup} баров")
+    if len(df) > args.warmup:
+        print(f"  торгуем с бара {fmt_time(df['time'].iloc[args.warmup])} UTC")
+    else:
+        print("  баров меньше, чем прогрев: сделок не будет")
+    print(
+        f"  сигналы в прогреве (не торгуем, могут отличаться от TV): "
+        f"BUY {int(buys[in_warmup].sum())}, SELL {int(sells[in_warmup].sum())}"
+    )
+    print(f"  сигналы после прогрева: BUY {int(buys[~in_warmup].sum())}, SELL {int(sells[~in_warmup].sum())}")
+
+
+def export_csv(df: pd.DataFrame, path: Path, warmup: int) -> None:
+    """Бары с EMA и сигналами: для сверки с экспортом графика TradingView бар за баром."""
+    out = df[["time", "open", "high", "low", "close", "volume", "ema_fast", "ema_slow", "buy", "sell"]].copy()
+    out["warmup"] = out.index < warmup
+    out.to_csv(path, index=False)
+    print(f"  бары с EMA и сигналами выгружены в {path}")
+
+
 # --------------------------------------------------------------------------- запуск
 
 
@@ -185,11 +271,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--symbol", default="BTCUSDT")
     p.add_argument("--limit", type=int, default=1000, help="сколько свечей запросить (1..1000)")
     p.add_argument("--base-url", default=BYBIT_BASE_URL, help="например https://api.bytick.com")
+    p.add_argument("--fast", type=int, default=9, help="Fast EMA")
+    p.add_argument("--slow", type=int, default=21, help="Slow EMA")
+    p.add_argument(
+        "--warmup",
+        type=int,
+        default=None,
+        help="сколько первых баров не торговать, пока EMA не забудет засев (по умолчанию 10 * slow)",
+    )
+    p.add_argument("--ema-seed", choices=["sma", "first"], default="sma", help="чем засевать EMA")
     p.add_argument("--from-file", type=Path, help="взять сохранённый ответ Bybit (JSON) вместо запроса")
     p.add_argument("--save-raw", type=Path, help="сохранить сырой ответ Bybit в JSON")
+    p.add_argument("--csv", type=Path, help="выгрузить бары с EMA и сигналами в CSV")
     args = p.parse_args(argv)
     if not 1 <= args.limit <= 1000:
         p.error("--limit должен быть от 1 до 1000")
+    if args.fast < 1 or args.slow < 1:
+        p.error("длины EMA должны быть >= 1")
+    if args.warmup is None:
+        args.warmup = 10 * args.slow
+    if args.warmup < 0:
+        p.error("--warmup не может быть отрицательным")
     return args
 
 
@@ -213,6 +315,11 @@ async def main(argv: list[str] | None = None) -> int:
 
     df, report = clean_klines(payload)
     print_cleaning(df, report, args.symbol)
+
+    df = add_signals(df, args.fast, args.slow, args.ema_seed)
+    print_signals(df, args)
+    if args.csv:
+        export_csv(df, args.csv, args.warmup)
     return 0
 
 
