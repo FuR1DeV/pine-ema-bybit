@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+# выгрузки скрипта (--save-raw, --csv)
+*.json
+*.csv
