@@ -78,9 +78,10 @@ async def fetch_klines(
 
 def check_payload(payload: dict) -> None:
     """retCode == 0 и есть result.list. Проверяем и живой ответ, и файл из --from-file."""
-    if not isinstance(payload, dict) or payload.get("retCode") != 0:
-        code, msg = (payload.get("retCode"), payload.get("retMsg")) if isinstance(payload, dict) else (None, None)
-        raise BybitError(f"retCode={code} retMsg={msg!r}")
+    if not isinstance(payload, dict):
+        raise BybitError("ответ не JSON-объект")
+    if payload.get("retCode") != 0:
+        raise BybitError(f"retCode={payload.get('retCode')} retMsg={payload.get('retMsg')!r}")
     if not isinstance((payload.get("result") or {}).get("list"), list):
         raise BybitError("в ответе нет result.list")
 
@@ -381,7 +382,9 @@ def backtest(
             if position is not None:
                 res.ignored_signals += 1
             elif i + 1 == n:
-                res.last_bar_note = f"BUY на последнем баре {fmt_time(times[i])}: бара T+1 нет, вход не выполнен"
+                res.last_bar_note = (
+                    f"BUY на последнем баре {fmt_time(times[i])}: бара T+1 нет, вход не выполнен"
+                )
             else:
                 position = (i, i + 1, check_slippage(i, i + 1, "входа"))
         elif sells[i]:
@@ -427,7 +430,9 @@ def print_cleaning(df: pd.DataFrame, report: CleaningReport, symbol: str) -> Non
 def print_signals(df: pd.DataFrame, args: argparse.Namespace) -> None:
     in_warmup = df.index < args.warmup
     buys, sells = df["buy"], df["sell"]
-    print(f"\nИндикаторы: EMA {args.fast} / EMA {args.slow}, засев {args.ema_seed}, прогрев {args.warmup} баров")
+    print(
+        f"\nИндикаторы: EMA {args.fast} / EMA {args.slow}, засев {args.ema_seed}, прогрев {args.warmup} баров"
+    )
     if len(df) > args.warmup:
         print(f"  торгуем с бара {fmt_time(df['time'].iloc[args.warmup])} UTC")
     else:

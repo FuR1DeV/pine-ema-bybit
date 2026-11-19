@@ -116,7 +116,17 @@ def synthetic_bybit_response(n: int = 600) -> dict:
     for i in range(n):
         c = 60_000 + 300 * math.sin(i / 15)
         o = 60_000 + 300 * math.sin((i - 1) / 15)
-        rows.append([str(T0 + i * BAR_MS), f"{o:.2f}", f"{max(o, c) + 5:.2f}", f"{min(o, c) - 5:.2f}", f"{c:.2f}", "1", "1"])
+        rows.append(
+            [
+                str(T0 + i * BAR_MS),
+                f"{o:.2f}",
+                f"{max(o, c) + 5:.2f}",
+                f"{min(o, c) - 5:.2f}",
+                f"{c:.2f}",
+                "1",
+                "1",
+            ]
+        )
     rows.reverse()  # как у Bybit: от новых к старым
     return {"retCode": 0, "retMsg": "OK", "result": {"list": rows}, "time": T0 + n * BAR_MS - 1}
 

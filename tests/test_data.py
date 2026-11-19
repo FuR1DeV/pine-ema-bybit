@@ -50,7 +50,7 @@ def test_clean_dirty_response():
 
 def test_closed_candle_is_kept_at_exact_boundary():
     # свеча 0 закрывается ровно в T0 + 60 с
-    df, rep = clean_klines(payload([bar(0)], now_ms=T0 + BAR_MS))
+    _, rep = clean_klines(payload([bar(0)], now_ms=T0 + BAR_MS))
     assert rep.unclosed == 0 and rep.kept == 1
 
 

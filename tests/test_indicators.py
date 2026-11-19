@@ -27,9 +27,9 @@ def test_ema_shorter_than_length_is_all_na():
 
 
 def test_ema_rejects_bad_args():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="length"):
         ema([1.0], 0)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="seed"):
         ema([1.0], 1, seed="zero")
 
 
