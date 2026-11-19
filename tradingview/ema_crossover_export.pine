@@ -1,0 +1,15 @@
+//@version=5
+// Исходная стратегия из задания без изменений логики. Добавлены только два plot,
+// чтобы значения EMA попали в Export chart data и их можно было сверить с Python
+// бар за баром (compare_tv.py).
+strategy("EMA Crossover", overlay=true)
+fast = input.int(9, "Fast EMA")
+slow = input.int(21, "Slow EMA")
+emaFast = ta.ema(close, fast)
+emaSlow = ta.ema(close, slow)
+buySignal  = ta.crossover(emaFast, emaSlow)
+sellSignal = ta.crossunder(emaFast, emaSlow)
+plotshape(buySignal, title="BUY", style=shape.labelup, location=location.belowbar, color=color.green)
+plotshape(sellSignal, title="SELL", style=shape.labeldown, location=location.abovebar, color=color.red)
+plot(emaFast, "EMA Fast", color=color.orange)
+plot(emaSlow, "EMA Slow", color=color.blue)
