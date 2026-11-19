@@ -5,3 +5,5 @@ __pycache__/
 # выгрузки скрипта (--save-raw, --csv)
 *.json
 *.csv
+# сохранённый ответ Bybit для повторяемого прогона из README
+!examples/*.json
