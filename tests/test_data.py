@@ -36,7 +36,7 @@ def test_clean_dirty_response():
     df, rep = clean_klines(payload(rows, now))
 
     assert rep.received == 9
-    assert rep.descending
+    assert rep.order.startswith("от новых к старым")
     assert rep.unclosed == 1
     assert rep.duplicates == 1
     assert rep.broken == 2
@@ -129,3 +129,16 @@ def test_fetch_does_not_retry_4xx():
     with pytest.raises(httpx.HTTPStatusError):
         run_fetch(handler)
     assert len(calls) == 1
+
+
+def test_fetch_non_json_is_bybit_error():
+    def handler(request):
+        return httpx.Response(200, text="<html>blocked</html>")
+
+    with pytest.raises(BybitError, match="не JSON"):
+        run_fetch(handler)
+
+
+def test_mixed_order_is_reported():
+    _, rep = clean_klines(payload([bar(1), bar(0), bar(2)], now_ms=T0 + 10 * BAR_MS))
+    assert rep.order.startswith("вперемешку")

@@ -68,12 +68,21 @@ async def fetch_klines(
                 raise
             await asyncio.sleep(attempt)
 
-    payload = resp.json()
-    if payload.get("retCode") != 0:
-        raise BybitError(f"retCode={payload.get('retCode')} retMsg={payload.get('retMsg')!r}")
+    try:
+        payload = resp.json()
+    except ValueError as exc:  # например, HTML-страница вместо JSON
+        raise BybitError(f"ответ не JSON: {resp.text[:200]!r}") from exc
+    check_payload(payload)
+    return payload
+
+
+def check_payload(payload: dict) -> None:
+    """retCode == 0 и есть result.list. Проверяем и живой ответ, и файл из --from-file."""
+    if not isinstance(payload, dict) or payload.get("retCode") != 0:
+        code, msg = (payload.get("retCode"), payload.get("retMsg")) if isinstance(payload, dict) else (None, None)
+        raise BybitError(f"retCode={code} retMsg={msg!r}")
     if not isinstance((payload.get("result") or {}).get("list"), list):
         raise BybitError("в ответе нет result.list")
-    return payload
 
 
 # --------------------------------------------------------------------------- очистка
@@ -82,7 +91,7 @@ async def fetch_klines(
 @dataclass
 class CleaningReport:
     received: int = 0
-    descending: bool = False  # пришли ли свечи от новых к старым
+    order: str = ""  # в каком порядке пришли свечи
     malformed: int = 0  # строку не удалось разобрать (не хватает полей, не число)
     unclosed: int = 0  # свеча ещё не закрылась по времени
     broken: int = 0  # цена <= 0 или не число, high < low, open/close вне [low, high]
@@ -130,7 +139,12 @@ def clean_klines(payload: dict, now_ms: int | None = None) -> tuple[pd.DataFrame
         rows.append((ts, o, h, low, c, v))
 
     df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
-    report.descending = len(df) > 1 and bool(df["ts"].is_monotonic_decreasing)
+    if len(df) < 2 or df["ts"].is_monotonic_increasing:
+        report.order = "по возрастанию времени"
+    elif df["ts"].is_monotonic_decreasing:
+        report.order = "от новых к старым, отсортировано по времени"
+    else:
+        report.order = "вперемешку, отсортировано по времени"
 
     unclosed = df["ts"] + BAR_MS > now_ms
     report.unclosed = int(unclosed.sum())
@@ -397,8 +411,7 @@ def fmt_time(t: pd.Timestamp) -> str:
 def print_cleaning(df: pd.DataFrame, report: CleaningReport, symbol: str) -> None:
     print(f"Bybit spot {symbol} 1m: получено свечей {report.received}")
     print("Очистка данных:")
-    order = "от новых к старым, отсортировано по времени" if report.descending else "по возрастанию"
-    print(f"  порядок в ответе:            {order}")
+    print(f"  порядок в ответе:            {report.order}")
     print(f"  незакрытая текущая свеча:    {report.unclosed} (отброшена)")
     print(f"  битые бары:                  {report.broken} (удалены)")
     print(f"  дубли:                       {report.duplicates} (удалены)")
@@ -506,7 +519,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 async def load_payload(args: argparse.Namespace) -> dict:
     if args.from_file:
-        return json.loads(args.from_file.read_text(encoding="utf-8"))
+        try:
+            payload = json.loads(args.from_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise BybitError(f"не удалось прочитать {args.from_file}: {exc}") from exc
+        check_payload(payload)
+        return payload
     async with httpx.AsyncClient(base_url=args.base_url, timeout=10.0) as client:
         payload = await fetch_klines(client, args.symbol, args.limit)
     if args.save_raw:
