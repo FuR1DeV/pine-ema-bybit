@@ -5,7 +5,11 @@
    со спотового REST API Bybit (/v5/market/kline) одним запросом.
 2. Чистит данные (clean_klines): порядок, дубли, битые и незакрытая свеча, пропуски.
 3. Считает EMA 9/21 и пересечения так же, как ta.ema / ta.crossover / ta.crossunder.
+4. Прогоняет Spot Long-only: сигнал по Close бара T, сделка по Open бара T + 1,
+   вход 1000 USDT, комиссия 0.1% на вход и 0.18% на выход.
+5. Печатает сводку очистки, закрытые сделки и итоговую статистику.
 
+Запуск: python solution.py (параметры: python solution.py --help).
 Решения и известные расхождения с TradingView описаны в README.md.
 """
 
@@ -16,7 +20,8 @@ import asyncio
 import json
 import sys
 import time
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
@@ -26,6 +31,11 @@ import pandas as pd
 BYBIT_BASE_URL = "https://api.bybit.com"
 KLINE_PATH = "/v5/market/kline"
 BAR_MS = 60_000  # таймфрейм 1 минута
+
+ORDER_USDT = 1000.0  # фиксированный размер входа
+FEE_ENTRY = 0.001  # 0.1% от суммы покупки
+FEE_EXIT = 0.0018  # 0.18% от суммы продажи
+SLIPPAGE_LIMIT = 0.005  # предупреждаем, если исполнение дальше 0.5% от сигнальной Close
 
 
 class BybitError(RuntimeError):
@@ -216,6 +226,167 @@ def add_signals(df: pd.DataFrame, fast: int, slow: int, seed: str = "sma") -> pd
     return out
 
 
+# --------------------------------------------------------------------------- исполнение
+
+
+def trade_pnl(
+    entry_price: float,
+    exit_price: float,
+    order_usdt: float = ORDER_USDT,
+    fee_entry: float = FEE_ENTRY,
+    fee_exit: float = FEE_EXIT,
+) -> tuple[float, float, float, float, float]:
+    """Комиссии берём от фактической суммы каждой сделки.
+
+    Вход: тратим order_usdt, комиссия входа order_usdt * fee_entry удерживается
+    из покупки, поэтому монет получаем qty = (order_usdt - комиссия) / entry_price.
+    Выход: продаём все qty, выручка qty * exit_price, комиссия выхода выручка * fee_exit.
+    Чистый PnL = выручка - комиссия выхода - order_usdt; в процентах от order_usdt.
+
+    Возвращает (qty, комиссия входа, комиссия выхода, PnL USDT, PnL %).
+    """
+    fee_in = order_usdt * fee_entry
+    qty = (order_usdt - fee_in) / entry_price
+    proceeds = qty * exit_price
+    fee_out = proceeds * fee_exit
+    pnl = proceeds - fee_out - order_usdt
+    return qty, fee_in, fee_out, pnl, pnl / order_usdt * 100
+
+
+@dataclass
+class Trade:
+    entry_time: pd.Timestamp  # бар T + 1 после сигнала BUY
+    entry_signal_price: float  # Close бара T
+    entry_price: float  # Open бара T + 1
+    exit_time: pd.Timestamp
+    exit_signal_price: float
+    exit_price: float
+    qty: float
+    fee_entry: float
+    fee_exit: float
+    pnl_usdt: float
+    pnl_pct: float
+    entry_slippage: float  # цена исполнения / сигнальная Close - 1
+    exit_slippage: float
+    forced_exit: bool = False
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class BacktestResult:
+    trades: list[Trade] = field(default_factory=list)
+    warmup_signals: int = 0  # сигналы в зоне прогрева, не торгуем
+    ignored_signals: int = 0  # BUY в позиции или SELL без позиции
+    slippage_warnings: int = 0
+    last_bar_note: str | None = None  # сигнал на последнем баре, исполнить нечем
+
+
+def backtest(
+    df: pd.DataFrame,
+    warmup: int = 0,
+    order_usdt: float = ORDER_USDT,
+    fee_entry: float = FEE_ENTRY,
+    fee_exit: float = FEE_EXIT,
+    slippage_limit: float = SLIPPAGE_LIMIT,
+    warn: Callable[[str], None] = print,
+) -> BacktestResult:
+    """Spot Long-only: BUY открывает позицию на order_usdt, SELL продаёт всё в кэш.
+
+    Защита от look-ahead: сигнал бара T считается по его Close и известен только
+    после закрытия бара, поэтому сделка идёт по Open бара T + 1. На шаге i цикл
+    смотрит только на сигнал бара i и цену открытия бара i + 1.
+    - BUY в позиции и SELL без позиции игнорируются (позиция одна, шорта нет).
+    - Сигналы первых warmup баров не торгуем: там EMA ещё помнит засев.
+    - Сигнал на последнем баре исполнить нечем, бара T + 1 нет. BUY пропускаем,
+      SELL закрывает позицию по Close этого бара вместе с принудительным закрытием.
+    - Если на конец данных позиция открыта, закрываем её по последней цене (Close
+      последнего закрытого бара) и помечаем сделку.
+    - Если исполнение дальше slippage_limit от сигнальной Close, печатаем
+      предупреждение и помечаем сделку.
+    """
+    res = BacktestResult()
+    n = len(df)
+    times = df["time"].tolist()
+    ts = df["ts"].to_numpy()
+    opens = df["open"].to_numpy(dtype=float)
+    closes = df["close"].to_numpy(dtype=float)
+    buys = df["buy"].to_numpy(dtype=bool)
+    sells = df["sell"].to_numpy(dtype=bool)
+
+    def check_slippage(signal_i: int, exec_i: int, side: str) -> float:
+        slip = opens[exec_i] / closes[signal_i] - 1
+        if abs(slip) > slippage_limit:
+            res.slippage_warnings += 1
+            warn(
+                f"ПРЕДУПРЕЖДЕНИЕ: проскальзывание {side} {slip:+.2%}: "
+                f"сигнал {fmt_time(times[signal_i])} Close {closes[signal_i]:.2f}, "
+                f"исполнение {fmt_time(times[exec_i])} Open {opens[exec_i]:.2f}"
+            )
+        return slip
+
+    def close_position(pos: tuple[int, int, float], exit_signal_i: int, exit_i: int, forced: bool) -> Trade:
+        sig_in, in_i, slip_in = pos
+        exit_price = closes[exit_i] if forced else opens[exit_i]
+        slip_out = 0.0 if forced else check_slippage(exit_signal_i, exit_i, "выхода")
+        qty, fee_in, fee_out, pnl, pct = trade_pnl(opens[in_i], exit_price, order_usdt, fee_entry, fee_exit)
+        notes = []
+        if abs(slip_in) > slippage_limit:
+            notes.append(f"проскальзывание входа {slip_in:+.2%}")
+        if abs(slip_out) > slippage_limit:
+            notes.append(f"проскальзывание выхода {slip_out:+.2%}")
+        if ts[in_i] - ts[sig_in] > BAR_MS:
+            notes.append("вход после пропуска минут")
+        if not forced and ts[exit_i] - ts[exit_signal_i] > BAR_MS:
+            notes.append("выход после пропуска минут")
+        if forced:
+            notes.append("закрыта принудительно по последней цене")
+        return Trade(
+            entry_time=times[in_i],
+            entry_signal_price=closes[sig_in],
+            entry_price=opens[in_i],
+            exit_time=times[exit_i],
+            exit_signal_price=closes[exit_signal_i],
+            exit_price=exit_price,
+            qty=qty,
+            fee_entry=fee_in,
+            fee_exit=fee_out,
+            pnl_usdt=pnl,
+            pnl_pct=pct,
+            entry_slippage=slip_in,
+            exit_slippage=slip_out,
+            forced_exit=forced,
+            notes=notes,
+        )
+
+    start = min(warmup, n)
+    res.warmup_signals = int(buys[:start].sum() + sells[:start].sum())
+    position: tuple[int, int, float] | None = None  # (бар сигнала, бар входа, проскальзывание входа)
+
+    for i in range(start, n):
+        if buys[i]:
+            if position is not None:
+                res.ignored_signals += 1
+            elif i + 1 == n:
+                res.last_bar_note = f"BUY на последнем баре {fmt_time(times[i])}: бара T+1 нет, вход не выполнен"
+            else:
+                position = (i, i + 1, check_slippage(i, i + 1, "входа"))
+        elif sells[i]:
+            if position is None:
+                res.ignored_signals += 1
+            elif i + 1 == n:
+                res.last_bar_note = (
+                    f"SELL на последнем баре {fmt_time(times[i])}: бара T+1 нет, "
+                    "позиция закрыта по Close этого бара"
+                )
+            else:
+                res.trades.append(close_position(position, i, i + 1, forced=False))
+                position = None
+
+    if position is not None:
+        res.trades.append(close_position(position, n - 1, n - 1, forced=True))
+    return res
+
+
 # --------------------------------------------------------------------------- вывод
 
 
@@ -261,6 +432,44 @@ def export_csv(df: pd.DataFrame, path: Path, warmup: int) -> None:
     out["warmup"] = out.index < warmup
     out.to_csv(path, index=False)
     print(f"  бары с EMA и сигналами выгружены в {path}")
+
+
+def print_trades(res: BacktestResult) -> None:
+    print("Закрытые сделки (время UTC; вход и выход по Open бара, следующего за сигналом):")
+    if not res.trades:
+        print("  сделок нет")
+        return
+    print(
+        f"  {'#':>3}  {'вход':16}  {'цена':>10}  {'выход':16}  {'цена':>10}  "
+        f"{'PnL USDT':>9}  {'PnL %':>7}  {'проск. вх/вых':>15}  отметки"
+    )
+    for k, t in enumerate(res.trades, 1):
+        slip = f"{t.entry_slippage:+.2%}/" + ("-" if t.forced_exit else f"{t.exit_slippage:+.2%}")
+        print(
+            f"  {k:>3}  {fmt_time(t.entry_time)}  {t.entry_price:>10.2f}  {fmt_time(t.exit_time)}  "
+            f"{t.exit_price:>10.2f}  {t.pnl_usdt:>+9.2f}  {t.pnl_pct:>+7.2f}  {slip:>15}  "
+            f"{', '.join(t.notes) or '-'}"
+        )
+
+
+def print_summary(res: BacktestResult, order_usdt: float = ORDER_USDT) -> None:
+    trades = res.trades
+    total = sum(t.pnl_usdt for t in trades)
+    fees = sum(t.fee_entry + t.fee_exit for t in trades)
+    wins = sum(t.pnl_usdt > 0 for t in trades)
+    forced = sum(t.forced_exit for t in trades)
+    print("\nИтого:")
+    print(f"  сделок: {len(trades)} (из них закрыта принудительно в конце данных: {forced})")
+    if trades:
+        print(f"  Winrate: {wins / len(trades):.1%} ({wins} из {len(trades)} с чистым PnL > 0)")
+    else:
+        print("  Winrate: нет сделок")
+    print(f"  суммарный чистый PnL: {total:+.2f} USDT (каждая сделка на {order_usdt:.0f} USDT)")
+    print(f"  в том числе комиссии: {fees:.2f} USDT")
+    print(f"  предупреждений о проскальзывании > {SLIPPAGE_LIMIT:.1%}: {res.slippage_warnings}")
+    print(f"  проигнорировано сигналов (BUY в позиции, SELL без позиции): {res.ignored_signals}")
+    if res.last_bar_note:
+        print(f"  {res.last_bar_note}")
 
 
 # --------------------------------------------------------------------------- запуск
@@ -320,6 +529,11 @@ async def main(argv: list[str] | None = None) -> int:
     print_signals(df, args)
     if args.csv:
         export_csv(df, args.csv, args.warmup)
+
+    print()
+    res = backtest(df, args.warmup)
+    print_trades(res)
+    print_summary(res)
     return 0
 
 
